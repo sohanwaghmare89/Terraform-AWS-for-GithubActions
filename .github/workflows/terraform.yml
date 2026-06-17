@@ -1,0 +1,173 @@
+name: Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options: [qa, stg, prod]
+        required: true
+      resource:
+        description: "Terraform resource/module to manage"
+        type: choice
+        options: [vpc, rds, s3, ec2, eks, ecr, pritunl, irsa, ec2-ssm, cloudwatch, lambda]
+        required: true
+      action:
+        description: "Terraform action to perform"
+        type: choice
+        options: [plan, apply]
+        required: true
+
+  pull_request:
+    branches:
+      - main
+
+env:
+  TF_VERSION: "1.12.0"
+  AWS_REGION: "me-central-1"
+  TF_STATE_BUCKET: "mytfbucket-tfstates"
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git diff to work
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Detect environment and resource (auto or manual)
+        id: envsetup
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+            RESOURCE="${{ github.event.inputs.resource }}"
+            ACTION="${{ github.event.inputs.action }}"
+            
+            # Try multiple path patterns based on directory structure
+            # Pattern 1: variables/non-prod/qa/irsa.tfvars or variables/non-prod/stg/irsa.tfvars
+            if [ "$ENV" == "qa" ] || [ "$ENV" == "stg" ]; then
+              if [ -f "$GITHUB_WORKSPACE/variables/non-prod/$ENV/$RESOURCE.tfvars" ]; then
+                VAR_FILE="$GITHUB_WORKSPACE/variables/non-prod/$ENV/$RESOURCE.tfvars"
+              fi
+            fi
+            
+            # Pattern 2: variables/non-prod/vpc.tfvars (resources directly under non-prod)
+            if [ -z "$VAR_FILE" ] && [ "$ENV" == "non-prod" ]; then
+              if [ -f "$GITHUB_WORKSPACE/variables/non-prod/$RESOURCE.tfvars" ]; then
+                VAR_FILE="$GITHUB_WORKSPACE/variables/non-prod/$RESOURCE.tfvars"
+              fi
+            fi
+            
+            # Pattern 3: variables/prod/irsa.tfvars (top-level environments)
+            if [ -z "$VAR_FILE" ]; then
+              if [ -f "$GITHUB_WORKSPACE/variables/$ENV/$RESOURCE.tfvars" ]; then
+                VAR_FILE="$GITHUB_WORKSPACE/variables/$ENV/$RESOURCE.tfvars"
+              fi
+            fi
+            
+            # Pattern 4: Try nested structure as fallback (for any environment with nested dirs)
+            if [ -z "$VAR_FILE" ]; then
+              NESTED_DIRS=$(find "$GITHUB_WORKSPACE/variables/$ENV" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+              if [ -n "$NESTED_DIRS" ]; then
+                for NESTED_DIR in $NESTED_DIRS; do
+                  if [ -f "$NESTED_DIR/$RESOURCE.tfvars" ]; then
+                    VAR_FILE="$NESTED_DIR/$RESOURCE.tfvars"
+                    break
+                  fi
+                done
+              fi
+            fi
+            
+            if [ -z "$VAR_FILE" ]; then
+              echo "Error: Could not find variables file for $ENV/$RESOURCE"
+              echo "Searched paths:"
+              echo "  - variables/non-prod/$ENV/$RESOURCE.tfvars"
+              echo "  - variables/non-prod/$RESOURCE.tfvars"
+              echo "  - variables/$ENV/$RESOURCE.tfvars"
+              exit 1
+            fi
+          else
+            BASE_BRANCH="${{ github.event.pull_request.base.ref || 'main' }}"
+            MODIFIED_FILES=$(git diff --name-only origin/$BASE_BRANCH | grep '^variables/.*\.tfvars' || true)
+            if [ -z "$MODIFIED_FILES" ]; then
+              echo "No .tfvars files modified. Exiting."
+              exit 0
+            fi
+            FILE=$(echo "$MODIFIED_FILES" | head -n 1)
+            # Extract env from path (handles both flat and nested structures)
+            PATH_PARTS=$(echo "$FILE" | tr '/' '\n')
+            ENV=$(echo "$PATH_PARTS" | sed -n '2p')
+            RESOURCE=$(basename "$FILE" .tfvars)
+            VAR_FILE="$GITHUB_WORKSPACE/$FILE"
+            if [ "${{ github.event_name }}" == "push" ]; then
+              ACTION="apply"
+            else
+              ACTION="plan"
+            fi
+          fi
+          
+          # Read env value from tfvars file to determine state location
+          # Handles both: env = "stg" and env    = "stg" formats
+          STATE_ENV=$(grep "^env" "$VAR_FILE" | head -1 | sed -E 's/.*=\s*"?([^"[:space:]]+)"?.*/\1/' | head -1 || echo "$ENV")
+      
+          echo "TF_ENV=$ENV" >> $GITHUB_ENV
+          echo "TF_RESOURCE=$RESOURCE" >> $GITHUB_ENV
+          echo "TF_ACTION=$ACTION" >> $GITHUB_ENV
+          echo "TF_VAR_FILE=$VAR_FILE" >> $GITHUB_ENV
+          echo "TF_STATE_KEY=$STATE_ENV/$RESOURCE.tfstate" >> $GITHUB_ENV
+          echo "MODULE_DIR=$GITHUB_WORKSPACE/modules/$RESOURCE" >> $GITHUB_ENV
+        
+      - name: Terraform Init
+        working-directory: ${{ env.MODULE_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Terraform Format
+        working-directory: ${{ env.MODULE_DIR }}
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: ${{ env.MODULE_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: env.TF_ACTION == 'plan' 
+        working-directory: ${{ env.MODULE_DIR }}
+        run: terraform plan -var-file=${{ env.TF_VAR_FILE }}
+
+      - name: Block apply and destroy on non-main branches
+        if: env.TF_ACTION == 'apply' && github.ref != 'refs/heads/main'
+        run: |
+          echo "❌ Terraform apply is only allowed from main branch"
+          exit 1
+          
+      - name: Terraform Apply
+        if: env.TF_ACTION == 'apply' && github.ref == 'refs/heads/main'
+        working-directory: ${{ env.MODULE_DIR }}
+        run: terraform apply -auto-approve -var-file=${{ env.TF_VAR_FILE }}
+
+      - name: Terraform Destroy
+        if: env.TF_ACTION == 'destroy' && github.ref == 'refs/heads/main'
+        working-directory: ${{ env.MODULE_DIR }}
+        run: terraform destroy -auto-approve -var-file=${{ env.TF_VAR_FILE }}
